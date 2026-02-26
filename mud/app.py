@@ -6,6 +6,7 @@ MudApp - orchestrates the full MUD client session.
   - Processes input: expands aliases, handles #commands, sends to server
   - Runs trigger processing on each block of received text
   - Runs skills auto-use loop (disabled by default)
+  - Runs script engine for automated leveling/routing (disabled by default)
 
 Built-in client commands (prefix #):
   #help                        - show this list
@@ -22,16 +23,27 @@ Built-in client commands (prefix #):
   #state                       - show parsed game state
   #save                        - save all configs
   #quit                        - quit client
+
+Script commands (prefix #script):
+  #script load [file]          - load script config (default: configs/scripts.json)
+  #script start <route>        - start running a named route
+  #script pause                - pause execution
+  #script resume               - resume after pause
+  #script stop                 - stop and return to idle
+  #script status               - show current script state
+  #script routes               - list available routes in loaded config
 """
 
 import asyncio
 import logging
 import sys
+from pathlib import Path
 from typing import Optional
 
 from .aliases import AliasManager
 from .client import TelnetClient
 from .game_state import GameState
+from .script_engine import ScriptEngine
 from .skills import SkillsManager
 from .triggers import TriggerManager
 
@@ -58,6 +70,12 @@ class MudApp:
         self.state    = GameState()
         self._running = False
         self._send_queue: asyncio.Queue = asyncio.Queue()
+        self._config_dir = config_dir
+        self.script = ScriptEngine(
+            enqueue=self._enqueue,
+            get_state=lambda: self.state,
+            print_fn=self._print,
+        )
 
     # ------------------------------------------------------------------
     # Entry point
@@ -82,6 +100,7 @@ class MudApp:
         read_task   = asyncio.create_task(self.client.read_loop(),   name="read_loop")
         send_task   = asyncio.create_task(self._send_loop(),          name="send_loop")
         skills_task = asyncio.create_task(self._skills_loop(),        name="skills_loop")
+        script_task = asyncio.create_task(self.script.run(),          name="script_loop")
 
         # Input loop (runs in thread pool so it doesn't block the event loop)
         try:
@@ -91,9 +110,9 @@ class MudApp:
         finally:
             self._running = False
             await self.client.disconnect()
-            for task in (read_task, send_task, skills_task):
+            for task in (read_task, send_task, skills_task, script_task):
                 task.cancel()
-            await asyncio.gather(read_task, send_task, skills_task, return_exceptions=True)
+            await asyncio.gather(read_task, send_task, skills_task, script_task, return_exceptions=True)
             self._print(f"\n{_CLIENT}Goodbye.")
 
     # ------------------------------------------------------------------
@@ -172,6 +191,7 @@ class MudApp:
     async def _process_output(self, text: str) -> None:
         """Update state and fire triggers based on received text."""
         self.state.parse(text)
+        self.script.on_output(text)
 
         for cmd, delay in self.triggers.process(text):
             if delay > 0:
@@ -340,6 +360,44 @@ class MudApp:
         elif cmd in ("quit", "exit", "q"):
             self._running = False
             await self.client.disconnect()
+
+        # ---- script engine ----
+        elif cmd == "script":
+            sub = parts[1].lower() if len(parts) >= 2 else ""
+
+            if sub == "load":
+                path = Path(parts[2]) if len(parts) >= 3 else Path(self._config_dir) / "scripts.json"
+                err = self.script.load(path)
+                if err:
+                    self._print(f"{_ERR}{err}")
+
+            elif sub == "start":
+                if len(parts) < 3:
+                    self._print(f"{_CLIENT}Usage: #script start <route>")
+                else:
+                    err = self.script.start(parts[2])
+                    if err:
+                        self._print(f"{_ERR}{err}")
+
+            elif sub == "pause":
+                self.script.pause()
+
+            elif sub == "resume":
+                self.script.resume()
+
+            elif sub == "stop":
+                self.script.stop()
+
+            elif sub == "status":
+                self._print(self.script.status_str())
+
+            elif sub == "routes":
+                self._print(self.script.routes_str())
+
+            else:
+                self._print(
+                    f"{_CLIENT}Script subcommands: load, start, pause, resume, stop, status, routes"
+                )
 
         else:
             self._print(f"{_ERR}Unknown client command: #{cmd}  (try #help)")

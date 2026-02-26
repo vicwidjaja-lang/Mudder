@@ -1,0 +1,54 @@
+{
+  "_comment": "Leveling script config. Edit routes and buffs to match your character/area.",
+
+  "loop": true,
+  "heal_threshold_pct": 50,
+  "full_health_pct": 90,
+  "heal_route": "to_healing",
+  "return_route": "from_healing",
+
+  "routes": {
+    "leveling": [
+      {"cmd": "n",            "delay": 1.2},
+      {"cmd": "n",            "delay": 1.2},
+      {"cmd": "e",            "delay": 1.2},
+      {"cmd": "kill goblin",  "delay": 0.5},
+      {"cmd": "e",            "delay": 1.2},
+      {"cmd": "kill goblin",  "delay": 0.5},
+      {"cmd": "w",            "delay": 1.2},
+      {"cmd": "s",            "delay": 1.2},
+      {"cmd": "s",            "delay": 1.2}
+    ],
+
+    "to_healing": [
+      {"cmd": "recall",  "delay": 2.0},
+      {"cmd": "n",       "delay": 1.0},
+      {"cmd": "e",       "delay": 1.0},
+      {"cmd": "rest",    "delay": 1.0}
+    ],
+
+    "from_healing": [
+      {"cmd": "stand",   "delay": 0.5},
+      {"cmd": "w",       "delay": 1.0},
+      {"cmd": "s",       "delay": 1.0}
+    ]
+  },
+
+  "buffs": [
+    {
+      "spell": "cast armor",
+      "expiry_pattern": "Your armor spell has worn off",
+      "active": true
+    },
+    {
+      "spell": "cast bless",
+      "expiry_pattern": "You feel less holy\\.",
+      "active": true
+    },
+    {
+      "spell": "cast shield",
+      "expiry_pattern": "Your magical shield crumbles away",
+      "active": true
+    }
+  ]
+}
