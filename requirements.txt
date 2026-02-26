@@ -1,7 +1,9 @@
-# Core dependency — provides readline-style input, input history,
-# and clean concurrent output (game text doesn't mess up the input line).
-# Install: pip install prompt_toolkit
-#
-# The client will fall back to plain input() if this is not installed,
-# but the UX is much better with it.
+# For the interactive terminal client (main.py)
+# Provides readline-style input + clean concurrent output.
+# Falls back to plain input() if not installed.
 prompt_toolkit>=3.0.0
+
+# For the MCP server (mud_mcp_server.py)
+# Allows Claude to play the MUD via chat using MCP tools.
+# Requires Python >= 3.10
+mcp>=1.0.0
