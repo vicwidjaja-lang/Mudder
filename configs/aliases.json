@@ -1,0 +1,18 @@
+{
+  "aliases": {
+    "kk": "kill",
+    "sc": "score",
+    "inv": "inventory",
+    "eq": "equipment",
+    "af": "affected",
+    "wh": "where",
+    "rec": "recall",
+    "rs": "rest",
+    "slp": "sleep",
+    "wk": "wake",
+    "fl": "flee",
+    "gt": "get all",
+    "lk": "look",
+    "hr": "health"
+  }
+}

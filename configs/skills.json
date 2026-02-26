@@ -1,0 +1,71 @@
+{
+  "auto_skill": false,
+  "cycle_interval": 2.0,
+  "skills": [
+    {
+      "name": "flee_emergency",
+      "command": "flee",
+      "priority": 0,
+      "enabled": false,
+      "cooldown": 15.0,
+      "require_combat": true,
+      "hp_min_pct": 0,
+      "hp_max_pct": 20,
+      "mana_min_pct": 0,
+      "mana_max_pct": 100,
+      "description": "Emergency flee when HP < 20%. DISABLED by default. Enable with #skill flee_emergency on"
+    },
+    {
+      "name": "bash",
+      "command": "bash",
+      "priority": 1,
+      "enabled": false,
+      "cooldown": 4.0,
+      "require_combat": true,
+      "hp_min_pct": 0,
+      "hp_max_pct": 100,
+      "mana_min_pct": 0,
+      "mana_max_pct": 100,
+      "description": "Bash current opponent (warrior). Enable with #skill bash on then #autoskill on"
+    },
+    {
+      "name": "kick",
+      "command": "kick",
+      "priority": 2,
+      "enabled": false,
+      "cooldown": 3.0,
+      "require_combat": true,
+      "hp_min_pct": 0,
+      "hp_max_pct": 100,
+      "mana_min_pct": 0,
+      "mana_max_pct": 100,
+      "description": "Kick current opponent."
+    },
+    {
+      "name": "rescue",
+      "command": "rescue",
+      "priority": 3,
+      "enabled": false,
+      "cooldown": 5.0,
+      "require_combat": true,
+      "hp_min_pct": 0,
+      "hp_max_pct": 100,
+      "mana_min_pct": 0,
+      "mana_max_pct": 100,
+      "description": "Rescue command (requires a target name — edit command field)."
+    },
+    {
+      "name": "backstab",
+      "command": "backstab",
+      "priority": 1,
+      "enabled": false,
+      "cooldown": 6.0,
+      "require_combat": false,
+      "hp_min_pct": 0,
+      "hp_max_pct": 100,
+      "mana_min_pct": 0,
+      "mana_max_pct": 100,
+      "description": "Thief opening attack (use before entering combat)."
+    }
+  ]
+}

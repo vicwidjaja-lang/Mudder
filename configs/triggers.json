@@ -1,0 +1,54 @@
+{
+  "triggers": [
+    {
+      "name": "flee_critical",
+      "pattern": "You wish that your wounds would stop BLEEDING",
+      "command": "flee",
+      "enabled": false,
+      "cooldown": 15.0,
+      "delay": 0.0,
+      "gag": false,
+      "description": "Auto-flee when critically wounded. DISABLED — enable with: #trigger flee_critical on"
+    },
+    {
+      "name": "wake_on_rest",
+      "pattern": "You feel less tired\\.",
+      "command": "wake",
+      "enabled": true,
+      "cooldown": 5.0,
+      "delay": 1.0,
+      "gag": false,
+      "description": "Auto-wake after resting"
+    },
+    {
+      "name": "stand_after_wake",
+      "pattern": "You wake, and stand up\\.",
+      "command": "stand",
+      "enabled": true,
+      "cooldown": 3.0,
+      "delay": 0.5,
+      "gag": false,
+      "description": "Auto-stand after waking"
+    },
+    {
+      "name": "kill_on_death_msg",
+      "pattern": "is DEAD!  R\\.I\\.P\\.",
+      "command": "",
+      "enabled": false,
+      "cooldown": 1.0,
+      "delay": 0.0,
+      "gag": false,
+      "description": "Fires when something dies. Add a command (loot corpse etc.) if desired."
+    },
+    {
+      "name": "example_tell_reply",
+      "pattern": "(\\w+) tells you '(.+)'",
+      "command": "",
+      "enabled": false,
+      "cooldown": 2.0,
+      "delay": 0.0,
+      "gag": false,
+      "description": "Example: capture group demo. $1 = sender name, $2 = message."
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+# Core dependency — provides readline-style input, input history,
+# and clean concurrent output (game text doesn't mess up the input line).
+# Install: pip install prompt_toolkit
+#
+# The client will fall back to plain input() if this is not installed,
+# but the UX is much better with it.
+prompt_toolkit>=3.0.0
