@@ -1,6 +1,38 @@
 {
   "triggers": [
     {
+      "name": "stat_roller",
+      "pattern": "\\[Str:\\s*(\\d+)\\s+Int:\\s*(\\d+)\\s+Wis:\\s*(\\d+)\\s+Dex:\\s*(\\d+)\\s+Con:\\s*(\\d+)\\]",
+      "command": "$1 $2 $3 $4 $5",
+      "action": "reroll",
+      "threshold": 240,
+      "enabled": false,
+      "cooldown": 1.0,
+      "delay": 0.0,
+      "gag": false,
+      "description": "Auto-reroll stats until total >= threshold. Enable with: #trigger stat_roller on"
+    },
+    {
+      "name": "set_prompt",
+      "pattern": "Reconnecting your master account|Obvious exits",
+      "command": "prompt %r [%e] %t%cHP:%h/%H  Mana:%m/%M  MV:%v/%V >",
+      "enabled": true,
+      "cooldown": 3600.0,
+      "delay": 0.5,
+      "gag": false,
+      "description": "SYSTEM PROMPT — edit 'command' here to change the in-game prompt for all characters. Fires on LD reconnect or first room entry each session (once per hour)."
+    },
+    {
+      "name": "color_prompt",
+      "pattern": "Do you want color\\? \\(Y/N\\)",
+      "command": "M;widjajaman;P3pp3rmint",
+      "enabled": true,
+      "cooldown": 10.0,
+      "delay": 0.0,
+      "gag": false,
+      "description": "Auto-reply to color prompt with login sequence"
+    },
+    {
       "name": "flee_critical",
       "pattern": "You wish that your wounds would stop BLEEDING",
       "command": "flee",
