@@ -80,15 +80,26 @@ _CAPTURE_PATTERNS = (
     "tells you",
     "you tell",
     " says ",
+    "you say",
+    "yell",
+    "shout",
     "gossip",
     "auction",
-    "shout",
     "newbie",
     "broadcast",
     "group",
     "clan",
     "guild",
+    "question",
+    "music",
 )
+
+# DSL bracket-format channels: [Channel] Name: 'message'
+_CHANNEL_TAGS = frozenset((
+    "newbie", "gossip", "auction", "clan", "guild",
+    "group", "question", "music", "broadcast",
+    "immtalk", "claninfo",
+))
 _SEVERE_DAMAGE_WORDS = (
     "mutilate",
     "disembowel",
@@ -798,12 +809,13 @@ class MudApp:
             low = line.strip().lower()
             if not low:
                 continue
-            if low.startswith("[broadcast"):
-                out.append(line.strip())
-                continue
-            if low.startswith("[") and "]" in low and any(tag in low for tag in ("newbie", "gossip", "auction", "clan", "guild", "group")):
-                out.append(line.strip())
-                continue
+            # DSL bracket-format: [Help] Name: 'msg', [Gossip] Name: 'msg', etc.
+            if low.startswith("["):
+                tag = low[1:low.index("]")].strip() if "]" in low else ""
+                if tag in _CHANNEL_TAGS:
+                    out.append(line.strip())
+                    continue
+            # Fallback substring patterns for non-bracket formats.
             if any(pat in low for pat in _CAPTURE_PATTERNS):
                 out.append(line.strip())
         if not out:
