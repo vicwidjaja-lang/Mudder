@@ -92,13 +92,15 @@ class MudBridgeServer:
     def _on_mud_data(self, text: str) -> None:
         """Sync callback from TelnetClient.read_loop — fan out to all clients."""
         encoded = text.encode("utf-8", errors="replace")
+        loop = asyncio.get_running_loop()
 
         dead = []
         for writer in self._clients:
             try:
                 writer.write(encoded)
-                # schedule drain without blocking the callback
-                asyncio.get_event_loop().create_task(writer.drain())
+                # Schedule drain; exceptions are caught inside _safe_drain so
+                # a dead/slow client never propagates to the event loop handler.
+                loop.create_task(self._safe_drain(writer))
             except Exception as exc:
                 logger.warning("Dead bridge client, removing: %s", exc)
                 dead.append(writer)
@@ -114,6 +116,19 @@ class MudBridgeServer:
         # Parse state and fire triggers on the bridge side
         self.state.parse(text)
         asyncio.get_event_loop().create_task(self._process_triggers(text))
+
+    async def _safe_drain(self, writer: asyncio.StreamWriter) -> None:
+        """Drain a client writer; silently remove it on any error."""
+        try:
+            await asyncio.wait_for(writer.drain(), timeout=10.0)
+        except Exception as exc:
+            logger.warning("Bridge client drain failed, removing: %s", exc)
+            if writer in self._clients:
+                self._clients.remove(writer)
+            try:
+                writer.close()
+            except Exception:
+                pass
 
     async def _process_triggers(self, text: str) -> None:
         """Async trigger processing — fires auto-login and other triggers."""
