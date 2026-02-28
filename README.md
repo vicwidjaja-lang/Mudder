@@ -20,6 +20,19 @@ pip install prompt_toolkit        # optional but recommended
 python main.py                    # connects to dsl-mud.org:4000
 ```
 
+## Solo SharePlay GUI (non-terminal)
+
+Use the bridge plus a local GUI where both "You" and "Agent" can send
+commands into one shared session.
+
+```bash
+# terminal/tab 1
+.venv/bin/python bridge.py --log INFO
+
+# terminal/tab 2
+./shareplay-solo
+```
+
 ## In-game Client Commands
 
 All client commands start with `#`:

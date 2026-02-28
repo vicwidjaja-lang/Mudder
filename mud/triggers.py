@@ -37,6 +37,8 @@ class Trigger:
     delay: float = 0.0             # seconds to wait before sending command
     gag: bool = False              # suppress matched line from display
     description: str = ""
+    action: str = "send"           # "send" (default) or "reroll" (stat roller)
+    threshold: int = 0             # used by action="reroll": target stat total
     _last_fired: float = field(default=0.0, repr=False, compare=False)
     _compiled: Optional[re.Pattern] = field(default=None, repr=False, compare=False)
 
@@ -137,6 +139,8 @@ class TriggerManager:
                 delay=td.get("delay", 0.0),
                 gag=td.get("gag", False),
                 description=td.get("description", ""),
+                action=td.get("action", "send"),
+                threshold=td.get("threshold", 0),
             )
             t.compile()
             self._triggers[t.name] = t
@@ -157,6 +161,8 @@ class TriggerManager:
                 "delay": t.delay,
                 "gag": t.gag,
                 "description": t.description,
+                "action": t.action,
+                "threshold": t.threshold,
             })
         try:
             with open(self._path, "w") as fh:
@@ -168,19 +174,19 @@ class TriggerManager:
     # Processing
     # ------------------------------------------------------------------
 
-    def process(self, text: str) -> List[Tuple[str, float]]:
+    def process(self, text: str) -> List[Tuple[str, float, str, int]]:
         """
         Scan text line-by-line against all triggers.
-        Returns list of (command, delay) pairs to be sent.
+        Returns list of (command, delay, action, threshold) tuples.
         """
-        results: List[Tuple[str, float]] = []
+        results: List[Tuple[str, float, str, int]] = []
         for line in text.splitlines():
             for trigger in self._triggers.values():
                 m = trigger.match(line)
                 if m:
                     cmd = trigger.fire(m)
                     if cmd:
-                        results.append((cmd, trigger.delay))
+                        results.append((cmd, trigger.delay, trigger.action, trigger.threshold))
         return results
 
     # ------------------------------------------------------------------

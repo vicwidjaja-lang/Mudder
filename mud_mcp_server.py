@@ -60,6 +60,7 @@ sys.path.insert(0, str(_HERE))
 CONFIG_DIR = str(_HERE / "configs")
 
 from mud.client import TelnetClient
+from mud.bridge_client import BridgeClient
 from mud.game_state import GameState
 from mud.aliases import AliasManager
 from mud.skills import SkillsManager
@@ -111,6 +112,9 @@ def _all_recent_lines(max_lines: int = 200) -> list[str]:
     return lines[-max_lines:] if len(lines) > max_lines else lines
 
 
+# ── Bridge mode flag ──────────────────────────────────────────────────────────
+_use_bridge: bool = False
+
 # ── Connection state ──────────────────────────────────────────────────────────
 _client: Optional[TelnetClient] = None
 _state: GameState
@@ -122,20 +126,23 @@ _skills_task: Optional[asyncio.Task] = None
 
 
 def _on_server_data(text: str) -> None:
-    """Sync callback from TelnetClient.read_loop (runs inside event loop)."""
+    """Sync callback from TelnetClient/BridgeClient.read_loop (runs inside event loop)."""
     _buffer_text(text)
     _state.parse(text)
-    # Trigger auto-responses
-    for cmd, delay in _triggers.process(text):
-        asyncio.get_event_loop().create_task(_delayed_send(cmd, delay))
+    # Trigger auto-responses — only fire on direct connections; bridge handles triggers itself
+    if not _use_bridge:
+        for cmd, delay, action, threshold in _triggers.process(text):
+            if action == "send":
+                asyncio.get_event_loop().create_task(_delayed_send(cmd, delay))
 
 
 async def _delayed_send(cmd: str, delay: float) -> None:
     if delay > 0:
         await asyncio.sleep(delay)
     if _client and _client.connected:
-        await _client.send(cmd)
-        log.info("[trigger] sent: %r", cmd)
+        for part in cmd.split(";"):
+            await _client.send(part.strip())
+            log.info("[trigger] sent: %r", part.strip())
 
 
 async def _skills_loop() -> None:
@@ -189,17 +196,34 @@ mcp = FastMCP("MUD Player", lifespan=lifespan)
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-async def mud_connect(host: str = "dsl-mud.org", port: int = 4000) -> str:
+async def mud_connect(
+    host: str = "dsl-mud.org",
+    port: int = 4000,
+    use_bridge: bool = True,
+    bridge_host: str = "127.0.0.1",
+    bridge_port: int = 4001,
+) -> str:
     """
     Connect to the MUD server.
     Call this first. After connecting, call mud_read() to see the login prompt,
     then mud_login() or mud_send() to authenticate.
+
+    Set use_bridge=True to connect via the local bridge server (bridge.py) instead
+    of opening a direct connection. This lets Claude share a session with the human
+    player. bridge_host/bridge_port default to 127.0.0.1:4001.
     """
-    global _client, _read_task, _skills_task, _total_added, _read_cursor
+    global _client, _read_task, _skills_task, _total_added, _read_cursor, _use_bridge
     if _client and _client.connected:
         return "Already connected. Call mud_status() to check state."
 
-    _client = TelnetClient(host, port, rate_limit=0.6)
+    _use_bridge = use_bridge
+    if use_bridge:
+        _client = BridgeClient(bridge_host, bridge_port)
+        log.info("Using bridge at %s:%s", bridge_host, bridge_port)
+    else:
+        _client = TelnetClient(host, port, rate_limit=0.6)
+        log.info("Connecting directly to %s:%s", host, port)
+
     _client.on_data(_on_server_data)
     _output.clear()
     _total_added = 0
@@ -215,12 +239,22 @@ async def mud_connect(host: str = "dsl-mud.org", port: int = 4000) -> str:
     _read_task   = asyncio.create_task(_client.read_loop(), name="mud_read_loop")
     _skills_task = asyncio.create_task(_skills_loop(),      name="mud_skills_loop")
 
-    log.info("Connected to %s:%s", host, port)
-    # Give the server a moment to send its greeting
-    await asyncio.sleep(1.5)
-    greeting = "".join(_get_unread_lines(100, advance=False))
-    _read_cursor = _total_added  # mark all as read so next mud_read() shows new content
-    return f"Connected to {host}:{port}.\n\n--- Server greeting ---\n{greeting}"
+    if use_bridge:
+        log.info("Connected to bridge %s:%s", bridge_host, bridge_port)
+        await asyncio.sleep(0.5)
+        greeting = "".join(_get_unread_lines(100, advance=False))
+        _read_cursor = _total_added
+        return (
+            f"Connected to bridge at {bridge_host}:{bridge_port}.\n\n"
+            f"--- Recent bridge output ---\n{greeting}"
+        )
+    else:
+        log.info("Connected to %s:%s", host, port)
+        # Give the server a moment to send its greeting
+        await asyncio.sleep(1.5)
+        greeting = "".join(_get_unread_lines(100, advance=False))
+        _read_cursor = _total_added  # mark all as read so next mud_read() shows new content
+        return f"Connected to {host}:{port}.\n\n--- Server greeting ---\n{greeting}"
 
 
 @mcp.tool()
@@ -251,6 +285,28 @@ async def mud_login(name: str = "", password: str = "") -> str:
 
 
 @mcp.tool()
+async def mud_cmd(command: str, wait: float = 2.0) -> str:
+    """
+    Send a command and return the response in one step.
+    Prefer this over mud_send + mud_wait + mud_read — it's 3x faster.
+    Use semicolons to send multiple commands: 'get sword;wear sword'
+    """
+    if not (_client and _client.connected):
+        return "Not connected. Call mud_connect() first."
+    _new_output_ev.clear()
+    for part in command.split(";"):
+        expanded = _aliases.expand(part.strip())
+        ok = await _client.send(expanded)
+        if not ok:
+            return "Send failed — connection may have dropped."
+    try:
+        await asyncio.wait_for(_new_output_ev.wait(), timeout=wait)
+    except asyncio.TimeoutError:
+        pass
+    return "".join(_get_unread_lines(200)) or "(no response)"
+
+
+@mcp.tool()
 async def mud_send(command: str) -> str:
     """
     Send a command to the MUD (with alias expansion).
@@ -258,12 +314,15 @@ async def mud_send(command: str) -> str:
     """
     if not (_client and _client.connected):
         return "Not connected. Call mud_connect() first."
-    expanded = _aliases.expand(command)
-    ok = await _client.send(expanded)
-    if not ok:
-        return "Send failed — connection may have dropped."
-    log.info("Sent: %r (expanded from %r)", expanded, command)
-    return f"Sent: {expanded!r}"
+    results = []
+    for part in command.split(";"):
+        expanded = _aliases.expand(part.strip())
+        ok = await _client.send(expanded)
+        if not ok:
+            return "Send failed — connection may have dropped."
+        log.info("Sent: %r (expanded from %r)", expanded, part.strip())
+        results.append(expanded)
+    return "Sent: " + " ; ".join(f"{r!r}" for r in results)
 
 
 @mcp.tool()
