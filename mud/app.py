@@ -10,9 +10,14 @@ MudApp - orchestrates the full MUD client session.
 
 Built-in client commands (prefix #):
   #help                        - show this list
-  #alias <name> <cmd>          - add or update an alias
-  #alias <name>                - remove an alias
-  #aliases                     - list aliases
+  #char <name>                 - set active character (loads char-specific aliases)
+  #char                        - show active character
+  #alias <name> <cmd>          - add or update a global alias
+  #alias <name>                - remove a global alias
+  #aliases                     - list global aliases
+  #charalias <name> <cmd>      - set alias for active character only
+  #charalias <name>            - remove char alias
+  #charaliases                 - list char-specific aliases
   #trigger <name> <pat> <cmd>  - add trigger (name/pattern/command)
   #triggers                    - list triggers
   #trigger <name> on|off       - enable / disable trigger
@@ -137,6 +142,7 @@ class MudApp:
         self._last_user_input: str = ""
         self.damage_mask = DamageMask(enabled=True)
         self.damage_map = DamageMap(Path(config_dir) / "damage_map.json")
+        self._active_char: str = ""
         self.damage_map_enabled: bool = True
         self._pending_severe_labels: list[str] = []
         self._pending_hp_before: Optional[int] = None
@@ -263,8 +269,12 @@ class MudApp:
         else:
             for part in line.split(";"):
                 expanded = self.aliases.expand(part.strip())
-                self._log_user_command(expanded)
-                await self.client.send(expanded)
+                # Alias values may themselves be multi-command (semicolon-separated).
+                for cmd in expanded.split(";"):
+                    cmd = cmd.strip()
+                    if cmd:
+                        self._log_user_command(cmd)
+                        await self.client.send(cmd)
 
     # ------------------------------------------------------------------
     # Server output
@@ -369,6 +379,50 @@ class MudApp:
         # ---- help ----
         if cmd == "help":
             self._print(__doc__ or "")
+
+        # ---- character profile ----
+        elif cmd == "char":
+            if len(parts) >= 2:
+                name = parts[1].lower()
+                self._active_char = name
+                self.aliases.set_character(name)
+                char_als = self.aliases.list_char_aliases()
+                self._print(
+                    f"{_CLIENT}Active character: {name!r}  "
+                    f"({len(char_als)} char-specific aliases)"
+                )
+            else:
+                char = self.aliases.active_character()
+                self._print(
+                    f"{_CLIENT}Active character: {char!r}" if char else f"{_CLIENT}No active character set."
+                )
+
+        elif cmd == "charalias":
+            if len(parts) >= 3:
+                name, expansion = parts[1], " ".join(parts[2:])
+                try:
+                    self.aliases.set_char_alias(name, expansion)
+                    char = self.aliases.active_character()
+                    self._print(f"{_CLIENT}[{char}] alias set: {name!r} -> {expansion!r}")
+                except ValueError as exc:
+                    self._print(f"{_ERR}{exc}")
+            elif len(parts) == 2:
+                removed = self.aliases.remove_char_alias(parts[1])
+                if removed:
+                    self._print(f"{_CLIENT}Char alias {parts[1]!r} removed.")
+                else:
+                    self._print(f"{_CLIENT}No char alias named {parts[1]!r}.")
+            else:
+                self._print(f"{_CLIENT}Usage: #charalias <name> <expansion>  or  #charalias <name>  to remove")
+
+        elif cmd == "charaliases":
+            char = self.aliases.active_character()
+            als = self.aliases.list_char_aliases()
+            if als:
+                lines = [f"Char aliases [{char}]:"] + [f"  {k:<12} -> {v}" for k, v in sorted(als.items())]
+                self._print("\n".join(lines))
+            else:
+                self._print(f"{_CLIENT}No char-specific aliases for {char!r}." if char else f"{_CLIENT}No active character set.")
 
         # ---- alias management ----
         elif cmd == "alias":

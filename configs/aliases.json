@@ -14,5 +14,10 @@
     "gt": "get all",
     "lk": "look",
     "hr": "health"
+  },
+  "characters": {
+    "noitamin": {
+      "heal": "recall"
+    }
   }
 }
