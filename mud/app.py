@@ -21,6 +21,12 @@ Built-in client commands (prefix #):
   #skill <name> on|off         - enable / disable skill
   #autoskill on|off            - toggle auto-skill loop
   #state                       - show parsed game state
+  #log start                   - begin logging entered commands
+  #log stop [purpose]          - stop logging and save summary
+  #log purpose <label>         - classify the last saved log
+  #log status                  - show logging status
+  #dmgmask on|off|status       - compact damage lines to per-round totals
+  #dmgmap on|off|status|report|clear - map severe hit words to damage ranges
   #save                        - save all configs
   #quit                        - quit client
 
@@ -35,16 +41,22 @@ Script commands (prefix #script):
 """
 
 import asyncio
+import json
 import logging
+import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from .aliases import AliasManager
 from .client import TelnetClient
+from .damage_map import DamageMap
+from .damage_mask import DamageMask
 from .game_state import GameState
 from .script_engine import ScriptEngine
 from .skills import SkillsManager
+from .split_ui import SplitUI
 from .triggers import TriggerManager
 
 logger = logging.getLogger(__name__)
@@ -53,6 +65,43 @@ logger = logging.getLogger(__name__)
 _CLIENT = "\033[1;36m[CLIENT]\033[0m "
 _WARN   = "\033[1;33m[WARN]\033[0m "
 _ERR    = "\033[1;31m[ERR]\033[0m "
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mKHJABCDsuhl]")
+_DIRECTION_CMDS = {
+    "n", "s", "e", "w", "u", "d", "ne", "nw", "se", "sw",
+    "north", "south", "east", "west", "up", "down",
+}
+_FOR_DAMAGE_RE = re.compile(r"\bfor\s+(\d+)\s+damage\b", re.IGNORECASE)
+_CAPTURE_PATTERNS = (
+    "tells you",
+    "you tell",
+    " says ",
+    "gossip",
+    "auction",
+    "shout",
+    "newbie",
+    "broadcast",
+    "group",
+    "clan",
+    "guild",
+)
+_SEVERE_DAMAGE_WORDS = (
+    "mutilate",
+    "disembowel",
+    "dismember",
+    "massacre",
+    "mangle",
+    "demolish",
+    "devastate",
+    "obliterate",
+    "annihilate",
+    "eradicate",
+    "ghastly",
+    "horrid",
+    "dreadful",
+    "hideous",
+    "indescribable",
+    "unspeakable",
+)
 
 
 class MudApp:
@@ -62,12 +111,17 @@ class MudApp:
         port: int,
         config_dir: str,
         rate_limit: float = 0.5,
+        bridge_mode: bool = False,
+        ui_mode: str = "classic",
     ):
         self.client   = TelnetClient(host, port, rate_limit)
         self.aliases  = AliasManager(config_dir)
         self.triggers = TriggerManager(config_dir)
         self.skills   = SkillsManager(config_dir)
         self.state    = GameState()
+        self.config_dir = config_dir
+        self.bridge_mode = bridge_mode
+        self.ui_mode = ui_mode
         self._running = False
         self._send_queue: asyncio.Queue = asyncio.Queue()
         self._config_dir = config_dir
@@ -76,12 +130,31 @@ class MudApp:
             get_state=lambda: self.state,
             print_fn=self._print,
         )
+        self._last_room: Optional[str] = None
+        self._active_cmd_log: Optional[dict] = None
+        self._last_saved_log_id: Optional[str] = None
+        self._path_log_file = Path(config_dir) / "path_logs.jsonl"
+        self._last_user_input: str = ""
+        self.damage_mask = DamageMask(enabled=True)
+        self.damage_map = DamageMap(Path(config_dir) / "damage_map.json")
+        self.damage_map_enabled: bool = True
+        self._pending_severe_labels: list[str] = []
+        self._pending_hp_before: Optional[int] = None
+        self._split_ui: Optional[SplitUI] = None
 
     # ------------------------------------------------------------------
     # Entry point
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
+        if self.ui_mode == "split":
+            try:
+                self._split_ui = SplitUI()
+                await self._split_ui.start()
+            except Exception as exc:
+                self._split_ui = None
+                print(f"{_WARN}Split UI unavailable ({exc}); falling back to classic mode.", flush=True)
+
         self._print(f"Connecting to {self.client.host}:{self.client.port} ...")
 
         try:
@@ -114,6 +187,8 @@ class MudApp:
                 task.cancel()
             await asyncio.gather(read_task, send_task, skills_task, script_task, return_exceptions=True)
             self._print(f"\n{_CLIENT}Goodbye.")
+            if self._split_ui is not None:
+                await self._split_ui.stop()
 
     # ------------------------------------------------------------------
     # Input
@@ -121,6 +196,14 @@ class MudApp:
 
     async def _input_loop(self) -> None:
         """Read lines from stdin (non-blocking via executor)."""
+        if self._split_ui is not None:
+            while self._running and self.client.connected:
+                line = await self._split_ui.read_line()
+                if line is None:
+                    break
+                await self._handle_input(line)
+            return
+
         loop = asyncio.get_event_loop()
 
         # Try to use prompt_toolkit for a nicer experience; fall back to plain
@@ -137,7 +220,15 @@ class MudApp:
             with patch_stdout():
                 while self._running and self.client.connected:
                     try:
-                        line = await session.prompt_async("> ")
+                        default = self._last_user_input
+                        line = await session.prompt_async(
+                            "> ",
+                            default=default,
+                            pre_run=self._select_all_input if default else None,
+                        )
+                        # If user just hits Enter on untouched prefill, treat it as no-action.
+                        if default and line == default:
+                            line = ""
                         await self._handle_input(line)
                     except (EOFError, KeyboardInterrupt):
                         break
@@ -162,14 +253,18 @@ class MudApp:
     async def _handle_input(self, line: str) -> None:
         line = line.strip()
         if not line:
+            self._log_user_command("")
             await self.client.send("")
             return
+        self._last_user_input = line
 
         if line.startswith("#"):
             await self._handle_client_cmd(line[1:])
         else:
-            expanded = self.aliases.expand(line)
-            await self.client.send(expanded)
+            for part in line.split(";"):
+                expanded = self.aliases.expand(part.strip())
+                self._log_user_command(expanded)
+                await self.client.send(expanded)
 
     # ------------------------------------------------------------------
     # Server output
@@ -177,9 +272,18 @@ class MudApp:
 
     def _on_server_data(self, text: str) -> None:
         """Sync callback called from read_loop."""
-        # Print immediately (prompt_toolkit patch_stdout handles ordering)
-        sys.stdout.write(text)
-        sys.stdout.flush()
+        self._update_last_room(text)
+        masked = self.damage_mask.process(text)
+        normalized = self._normalize_terminal_output(masked)
+        if self._split_ui is not None:
+            self._split_ui.append_main(normalized)
+            capture = self._extract_capture_lines(normalized)
+            if capture:
+                self._split_ui.append_capture(capture)
+        else:
+            sys.stdout.write(normalized)
+            sys.stdout.flush()
+
 
         # Schedule async processing
         try:
@@ -190,17 +294,38 @@ class MudApp:
 
     async def _process_output(self, text: str) -> None:
         """Update state and fire triggers based on received text."""
+        prev_hp = self.state.hp
+        self._track_severe_incoming_hits(text, prev_hp)
         self.state.parse(text)
         self.script.on_output(text)
+        self._emit_damage_map_if_ready()
 
-        for cmd, delay in self.triggers.process(text):
-            if delay > 0:
-                await asyncio.sleep(delay)
-            await self._enqueue(cmd)
+        if not self.bridge_mode:
+            for cmd, delay, action, threshold in self.triggers.process(text):
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if action == "reroll":
+                    await self._handle_reroll(cmd, threshold)
+                else:
+                    for part in cmd.split(";"):
+                        await self._enqueue(part.strip())
 
     # ------------------------------------------------------------------
     # Send queue (serialises outgoing commands)
     # ------------------------------------------------------------------
+
+    async def _handle_reroll(self, stats_str: str, threshold: int) -> None:
+        """Echo stat total; auto-send N if below threshold."""
+        try:
+            total = sum(int(x) for x in stats_str.split())
+        except ValueError:
+            return
+        if total >= threshold:
+            sys.stdout.write(f"\033[1;32m>>> ROLL TOTAL: {total} — KEEP IT! (type Y) <<<\033[0m\n")
+        else:
+            sys.stdout.write(f"\033[1;31m>>> ROLL TOTAL: {total}/{threshold} — rerolling... <<<\033[0m\n")
+            await self._enqueue("N")
+        sys.stdout.flush()
 
     async def _enqueue(self, cmd: str) -> None:
         await self._send_queue.put(cmd)
@@ -346,8 +471,44 @@ class MudApp:
                 f"Mana: {s.mana}/{s.max_mana} ({s.mana_percent():.0f}%)  "
                 f"MV: {s.mv}/{s.max_mv}  "
                 f"Combat: {'YES' if s.in_combat else 'no'}  "
-                f"HP-crit: {s.hp_critical}"
+                f"HP-crit: {s.hp_critical}  "
+                f"Room: {self._last_room or 'unknown'}"
             )
+
+        # ---- command logging ----
+        elif cmd in ("log", "pathlog", "route"):
+            await self._handle_log_cmd(parts)
+
+        # ---- client-side damage masking ----
+        elif cmd == "dmgmask":
+            if len(parts) >= 2 and parts[1].lower() in ("on", "off"):
+                self.damage_mask.enabled = parts[1].lower() == "on"
+                status = "enabled" if self.damage_mask.enabled else "disabled"
+                self._print(f"{_CLIENT}Damage mask {status}.")
+            else:
+                self._print(f"{_CLIENT}{self.damage_mask.status_text()}")
+
+        elif cmd == "dmgmap":
+            sub = parts[1].lower() if len(parts) >= 2 else "status"
+            if sub in ("on", "off"):
+                self.damage_map_enabled = sub == "on"
+                status = "enabled" if self.damage_map_enabled else "disabled"
+                self._print(f"{_CLIENT}Damage mapping trigger {status}.")
+                if not self.damage_map_enabled:
+                    self._pending_severe_labels = []
+                    self._pending_hp_before = None
+            elif sub == "report":
+                lines = self.damage_map.report_lines()
+                self._print(f"{_CLIENT}Damage map samples:\n" + "\n".join(lines))
+            elif sub == "clear":
+                self.damage_map.clear()
+                self._pending_severe_labels = []
+                self._pending_hp_before = None
+                self._print(f"{_CLIENT}Damage map samples cleared.")
+            else:
+                status = "ON" if self.damage_map_enabled else "OFF"
+                pending = ", ".join(self._pending_severe_labels) if self._pending_severe_labels else "none"
+                self._print(f"{_CLIENT}Damage mapping trigger: {status}. Pending severe hits: {pending}.")
 
         # ---- save ----
         elif cmd == "save":
@@ -406,6 +567,298 @@ class MudApp:
     # Helpers
     # ------------------------------------------------------------------
 
+    async def _handle_log_cmd(self, parts: list[str]) -> None:
+        if len(parts) < 2:
+            self._print(
+                f"{_CLIENT}Usage: #log start | #log stop [purpose] | #log purpose <label> | #log status"
+            )
+            return
+
+        sub = parts[1].lower()
+        if sub == "start":
+            if self._active_cmd_log is not None:
+                self._print(f"{_WARN}Command logging already active. Use #log stop first.")
+                return
+            self._active_cmd_log = {
+                "id": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "start_room": self._last_room or "unknown",
+                "commands": [],
+            }
+            self._print(
+                f"{_CLIENT}Command logging started. Start room: {self._active_cmd_log['start_room']!r}"
+            )
+            return
+
+        if sub == "status":
+            if self._active_cmd_log is None:
+                self._print(f"{_CLIENT}Command logging is OFF.")
+            else:
+                count = len(self._active_cmd_log["commands"])
+                self._print(
+                    f"{_CLIENT}Command logging is ON. "
+                    f"Commands captured: {count}. Start room: {self._active_cmd_log['start_room']!r}"
+                )
+            return
+
+        if sub == "stop":
+            if self._active_cmd_log is None:
+                self._print(f"{_WARN}No active command log. Use #log start first.")
+                return
+            purpose = " ".join(parts[2:]).strip() if len(parts) > 2 else "unclassified"
+            entry = dict(self._active_cmd_log)
+            entry["ended_at"] = datetime.now(timezone.utc).isoformat()
+            entry["end_room"] = self._last_room or "unknown"
+            entry["purpose"] = purpose
+            entry["summary"] = self._summarize_commands(entry["commands"])
+            self._append_path_log(entry)
+            self._last_saved_log_id = entry["id"]
+            self._active_cmd_log = None
+            self._print(
+                f"{_CLIENT}Command logging stopped. "
+                f"Saved {entry['summary']['total']} commands "
+                f"(directions={entry['summary']['directions']}, other={entry['summary']['other']})."
+            )
+            if purpose == "unclassified":
+                self._print(
+                    f"{_CLIENT}Set purpose with: #log purpose directions | #log purpose discard | "
+                    f"#log purpose levelling path"
+                )
+            return
+
+        if sub == "purpose":
+            label = " ".join(parts[2:]).strip() if len(parts) > 2 else ""
+            if not label:
+                self._print(f"{_CLIENT}Usage: #log purpose <directions|discard|levelling path|...>")
+                return
+            if not self._last_saved_log_id:
+                self._print(f"{_WARN}No saved log to classify yet. Use #log start then #log stop.")
+                return
+            updated = self._update_saved_log_purpose(self._last_saved_log_id, label)
+            if updated:
+                self._print(f"{_CLIENT}Updated log {self._last_saved_log_id} purpose -> {label!r}.")
+            else:
+                self._print(f"{_ERR}Could not update purpose for log {self._last_saved_log_id}.")
+            return
+
+        self._print(
+            f"{_CLIENT}Usage: #log start | #log stop [purpose] | #log purpose <label> | #log status"
+        )
+
+    def _update_last_room(self, text: str) -> None:
+        clean = _ANSI_RE.sub("", text)
+        lines = [ln.strip() for ln in clean.splitlines()]
+        for idx, line in enumerate(lines):
+            if not line:
+                continue
+            low = line.lower()
+            if "exits:" not in low and not low.startswith("obvious exits"):
+                continue
+            room = self._previous_room_candidate(lines, idx)
+            if room:
+                self._last_room = room
+
+    def _track_severe_incoming_hits(self, text: str, hp_before: int) -> None:
+        if not self.damage_map_enabled:
+            return
+        clean = _ANSI_RE.sub("", text)
+        for line in clean.splitlines():
+            low = line.strip().lower()
+            if not low:
+                continue
+            label = self._severe_label_from_line(low)
+            if not label:
+                continue
+
+            amount = self._extract_damage_amount(low)
+
+            # We hit someone else: exact amount is usually available.
+            if low.startswith("you ") or low.startswith("your "):
+                if amount is not None:
+                    self.damage_map.add("dealt", label, amount)
+                continue
+
+            # Someone hit us.
+            if " you" in f" {low} ":
+                if amount is not None:
+                    self.damage_map.add("taken", label, amount)
+                    self._print(f"{_CLIENT}[dmgmap] Severe hit ({label}) -> taken: {amount}")
+                else:
+                    self._pending_severe_labels.append(label)
+                    if self._pending_hp_before is None:
+                        self._pending_hp_before = hp_before
+                continue
+
+            # Other people taking severe hits: print inferred range from learned samples.
+            inferred = self.damage_map.get_combined_range(label)
+            if inferred:
+                low_amt, high_amt, count = inferred
+                self._print(
+                    f"{_CLIENT}[dmgmap] {label} observed on others -> estimated range {low_amt}-{high_amt} "
+                    f"(n={count})"
+                )
+
+    def _emit_damage_map_if_ready(self) -> None:
+        if not self.damage_map_enabled or not self._pending_severe_labels:
+            return
+        if self._pending_hp_before is None:
+            self._pending_severe_labels = []
+            return
+        hp_after = self.state.hp
+        if hp_after <= 0 and self.state.max_hp <= 0:
+            return
+        delta = self._pending_hp_before - hp_after
+        labels = ", ".join(self._pending_severe_labels)
+        if delta > 0:
+            self._print(f"{_CLIENT}[dmgmap] Severe hit ({labels}) -> estimated taken: {delta}")
+            if len(self._pending_severe_labels) == 1:
+                self.damage_map.add("taken", self._pending_severe_labels[0], delta)
+            self._pending_severe_labels = []
+            self._pending_hp_before = None
+        elif not self.state.in_combat:
+            # Drop stale pending severe markers when combat ends without a measurable HP drop.
+            self._pending_severe_labels = []
+            self._pending_hp_before = None
+
     @staticmethod
-    def _print(msg: str) -> None:
-        print(msg, flush=True)
+    def _severe_label_from_line(low: str) -> Optional[str]:
+        for word in _SEVERE_DAMAGE_WORDS:
+            if word in low:
+                return word.upper()
+        return None
+
+    @staticmethod
+    def _extract_damage_amount(low: str) -> Optional[int]:
+        m = _FOR_DAMAGE_RE.search(low)
+        if not m:
+            return None
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+
+    def _extract_capture_lines(self, text: str) -> str:
+        clean = _ANSI_RE.sub("", text)
+        out: list[str] = []
+        for line in clean.splitlines():
+            low = line.strip().lower()
+            if not low:
+                continue
+            if low.startswith("[broadcast"):
+                out.append(line.strip())
+                continue
+            if low.startswith("[") and "]" in low and any(tag in low for tag in ("newbie", "gossip", "auction", "clan", "guild", "group")):
+                out.append(line.strip())
+                continue
+            if any(pat in low for pat in _CAPTURE_PATTERNS):
+                out.append(line.strip())
+        if not out:
+            return ""
+        return "\n".join(out) + "\n"
+
+    @staticmethod
+    def _previous_room_candidate(lines: list[str], idx: int) -> Optional[str]:
+        for j in range(idx - 1, -1, -1):
+            cand = lines[j].strip()
+            if not cand:
+                continue
+            low = cand.lower()
+            if len(cand) > 80:
+                continue
+            if low.startswith("[dsl]") or low.startswith("your selection"):
+                continue
+            if "main login menu" in low or "visible mortals" in low:
+                continue
+            if low.startswith("hp:") or low.startswith("<"):
+                continue
+            if cand.startswith("(") and cand.endswith(")"):
+                continue
+            return cand
+        return None
+
+    def _log_user_command(self, cmd: str) -> None:
+        if self._active_cmd_log is None:
+            return
+        rendered = cmd.strip()
+        if not rendered:
+            rendered = "<ENTER>"
+        token = rendered.split()[0].lower() if rendered else ""
+        kind = "direction" if token in _DIRECTION_CMDS else "other"
+        self._active_cmd_log["commands"].append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "command": rendered,
+                "kind": kind,
+            }
+        )
+
+    @staticmethod
+    def _summarize_commands(commands: list[dict]) -> dict:
+        directions = sum(1 for c in commands if c.get("kind") == "direction")
+        total = len(commands)
+        return {
+            "total": total,
+            "directions": directions,
+            "other": total - directions,
+        }
+
+    def _append_path_log(self, entry: dict) -> None:
+        self._path_log_file.parent.mkdir(parents=True, exist_ok=True)
+        with self._path_log_file.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=True) + "\n")
+
+    def _update_saved_log_purpose(self, log_id: str, purpose: str) -> bool:
+        if not self._path_log_file.exists():
+            return False
+        lines = self._path_log_file.read_text(encoding="utf-8").splitlines()
+        updated = False
+        out = []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                out.append(line)
+                continue
+            if obj.get("id") == log_id:
+                obj["purpose"] = purpose
+                updated = True
+            out.append(json.dumps(obj, ensure_ascii=True))
+        if updated:
+            self._path_log_file.write_text("\n".join(out) + "\n", encoding="utf-8")
+        return updated
+
+    @staticmethod
+    def _normalize_terminal_output(text: str) -> str:
+        """
+        Normalize telnet line endings for local terminal rendering.
+        Raw carriage returns can move the cursor and overwrite the current
+        input line while typing; convert them to line breaks.
+        """
+        text = text.replace("\r\n", "\n")
+        text = text.replace("\r", "\n")
+        return text
+
+    @staticmethod
+    def _select_all_input() -> None:
+        """Select all prompt text so typing replaces last command immediately."""
+        try:
+            from prompt_toolkit.application.current import get_app
+            from prompt_toolkit.selection import SelectionType
+
+            buf = get_app().current_buffer
+            if not buf.text:
+                return
+            buf.cursor_position = 0
+            buf.start_selection(selection_type=SelectionType.CHARACTERS)
+            buf.cursor_position = len(buf.text)
+        except Exception:
+            # Keep prompt usable even if prompt_toolkit internals differ.
+            return
+
+    def _print(self, msg: str) -> None:
+        if self._split_ui is not None:
+            self._split_ui.append_main(msg + "\n")
+        else:
+            print(msg, flush=True)
