@@ -25,6 +25,9 @@ Built-in client commands (prefix #):
   #skills                      - list skills
   #skill <name> on|off         - enable / disable skill
   #autoskill on|off            - toggle auto-skill loop
+  #spellmaint on|off|status    - toggle/view spell maintainer
+  #spellmaint list             - list spell maintainer entries
+  #spellmaint <name> on|off    - enable / disable maintained spell
   #state                       - show parsed game state
   #log start                   - begin logging entered commands
   #log stop [purpose]          - stop logging and save summary
@@ -56,12 +59,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from .aliases import AliasManager
+from .affects import AffectTracker
 from .client import TelnetClient
 from .damage_map import DamageMap
 from .damage_mask import DamageMask
 from .game_state import GameState
 from .script_engine import ScriptEngine
 from .skills import SkillsManager
+from .spell_maintainer import SpellMaintainer
 from .triggers import TriggerManager
 
 if TYPE_CHECKING:
@@ -74,6 +79,7 @@ _CLIENT = "\033[1;36m[CLIENT]\033[0m "
 _WARN   = "\033[1;33m[WARN]\033[0m "
 _ERR    = "\033[1;31m[ERR]\033[0m "
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mKHJABCDsuhl]")
+_MAX_CAPTURE_LINES = 500
 _DIRECTION_CMDS = {
     "n", "s", "e", "w", "u", "d", "ne", "nw", "se", "sw",
     "north", "south", "east", "west", "up", "down",
@@ -83,12 +89,20 @@ _FOR_DAMAGE_RE = re.compile(r"\bfor\s+(\d+)\s+damage\b", re.IGNORECASE)
 _CHANNEL_TAGS = frozenset((
     "newbie", "gossip", "auction", "clan", "guild",
     "group", "question", "music", "broadcast",
-    "immtalk", "claninfo",
+    "immtalk", "claninfo", "kingdom", "ooc",
 ))
 _CHANNEL_BRACKET_RE = re.compile(r"^\[(?P<tag>[^\]]+)\]\s*(?P<rest>.+)$")
 _CHANNEL_BRACKET_MSG_RE = re.compile(r"^(?P<name>[^:]+):\s*'(?P<msg>.*)'\s*$")
 _CHANNEL_PAREN_RE = re.compile(
     r"^(?P<name>[A-Za-z][\w'-]*)\s*\((?P<tag>[A-Za-z]+)\)\s*'(?P<msg>.*)'\s*$",
+    re.IGNORECASE,
+)
+_CHANNEL_COLON_RE = re.compile(
+    r"^(?P<name>[A-Za-z][\w'-]*)\s+(?P<tag>[A-Za-z]+)\s*:\s*'(?P<msg>.*)'\s*$",
+    re.IGNORECASE,
+)
+_CHANNEL_OOC_RE = re.compile(
+    r"^(?P<name>[A-Za-z][\w'-]*)\s+OOC(?:\s+(?P<scope>[A-Za-z]+))?\s*:\s*'(?P<msg>.*)'\s*$",
     re.IGNORECASE,
 )
 _CHANNEL_TELL_RE = re.compile(
@@ -133,6 +147,7 @@ class MudApp:
         self.aliases  = AliasManager(config_dir)
         self.triggers = TriggerManager(config_dir)
         self.skills   = SkillsManager(config_dir)
+        self.spell_maintainer = SpellMaintainer(config_dir)
         self.state    = GameState()
         self.config_dir = config_dir
         self.bridge_mode = bridge_mode
@@ -153,10 +168,12 @@ class MudApp:
         self._last_user_input: str = ""
         self.damage_mask = DamageMask(enabled=True)
         self.damage_map = DamageMap(Path(config_dir) / "damage_map.json")
+        self.affects = AffectTracker(Path(config_dir) / "affect_windows.jsonl")
         self._active_char: str = ""
         self.damage_map_enabled: bool = True
         self._pending_severe_labels: list[str] = []
         self._pending_hp_before: Optional[int] = None
+        self._capture_feed_lines: list[str] = []
         self._split_ui: Optional["SplitUI"] = None
         self._restart_requested: bool = False
 
@@ -171,6 +188,7 @@ class MudApp:
                 self._split_ui = SplitUI()
                 self._split_ui.set_tick_source(self.state.tick_countdown)
                 await self._split_ui.start()
+                self._refresh_capture_panes()
             except Exception as exc:
                 self._split_ui = None
                 print(f"{_WARN}Split UI unavailable ({exc}); falling back to classic mode.", flush=True)
@@ -193,6 +211,7 @@ class MudApp:
         read_task   = asyncio.create_task(self.client.read_loop(),   name="read_loop")
         send_task   = asyncio.create_task(self._send_loop(),          name="send_loop")
         skills_task = asyncio.create_task(self._skills_loop(),        name="skills_loop")
+        spell_task  = asyncio.create_task(self._spell_maintainer_loop(), name="spell_maintainer_loop")
         script_task = asyncio.create_task(self.script.run(),          name="script_loop")
 
         # Input loop (runs in thread pool so it doesn't block the event loop)
@@ -203,9 +222,16 @@ class MudApp:
         finally:
             self._running = False
             await self.client.disconnect()
-            for task in (read_task, send_task, skills_task, script_task):
+            for task in (read_task, send_task, skills_task, spell_task, script_task):
                 task.cancel()
-            await asyncio.gather(read_task, send_task, skills_task, script_task, return_exceptions=True)
+            await asyncio.gather(
+                read_task,
+                send_task,
+                skills_task,
+                spell_task,
+                script_task,
+                return_exceptions=True,
+            )
             self._print(f"\n{_CLIENT}Goodbye.")
             if self._split_ui is not None:
                 await self._split_ui.stop()
@@ -295,6 +321,7 @@ class MudApp:
                 for cmd in expanded.split(";"):
                     cmd = cmd.strip()
                     if cmd:
+                        self._record_outgoing_command(cmd)
                         self._log_user_command(cmd)
                         await self.client.send(cmd)
 
@@ -309,9 +336,12 @@ class MudApp:
         normalized = self._normalize_terminal_output(masked)
         if self._split_ui is not None:
             self._split_ui.append_main(normalized)
-            capture = self._extract_capture_lines(normalized)
-            if capture:
-                self._split_ui.append_capture(capture)
+            capture_lines = self._extract_capture_lines(normalized)
+            if capture_lines:
+                self._capture_feed_lines.extend(capture_lines)
+                if len(self._capture_feed_lines) > _MAX_CAPTURE_LINES:
+                    self._capture_feed_lines = self._capture_feed_lines[-_MAX_CAPTURE_LINES:]
+                self._refresh_capture_panes()
         else:
             sys.stdout.write(normalized)
             sys.stdout.flush()
@@ -327,10 +357,18 @@ class MudApp:
     async def _process_output(self, text: str) -> None:
         """Update state and fire triggers based on received text."""
         prev_hp = self.state.hp
+        prev_game_minutes = self.state.game_time_minutes
         self._track_severe_incoming_hits(text, prev_hp)
         self.state.parse(text)
+        tick_delta = self._tick_delta(prev_game_minutes, self.state.game_time_minutes)
+        affects_changed = False
+        if tick_delta > 0:
+            affects_changed |= self.affects.on_tick(tick_delta)
+        affects_changed |= self.affects.process_output(text)
         self.script.on_output(text)
         self._emit_damage_map_if_ready()
+        if affects_changed:
+            self._refresh_capture_panes()
 
         if not self.bridge_mode:
             for cmd, delay, action, threshold in self.triggers.process(text):
@@ -360,6 +398,7 @@ class MudApp:
         sys.stdout.flush()
 
     async def _enqueue(self, cmd: str) -> None:
+        self._record_outgoing_command(cmd)
         await self._send_queue.put(cmd)
 
     async def _send_loop(self) -> None:
@@ -384,6 +423,21 @@ class MudApp:
                 cmd = self.skills.next_skill(self.state)
                 if cmd:
                     self._print(f"{_CLIENT}[auto-skill] {cmd}")
+                    await self._enqueue(cmd)
+            except asyncio.CancelledError:
+                break
+
+    async def _spell_maintainer_loop(self) -> None:
+        """Periodically maintain configured affects (combat vs idle policies)."""
+        while True:
+            try:
+                await asyncio.sleep(self.spell_maintainer.cycle_interval)
+                cmd = self.spell_maintainer.next_command(
+                    in_combat=self.state.in_combat,
+                    active_affects=self.affects.active_affects(),
+                )
+                if cmd:
+                    self._print(f"{_CLIENT}[spell-maint] {cmd}")
                     await self._enqueue(cmd)
             except asyncio.CancelledError:
                 break
@@ -539,6 +593,51 @@ class MudApp:
             else:
                 self._print(f"{_CLIENT}Usage: #autoskill on|off")
 
+        elif cmd == "spellmaint":
+            if len(parts) == 1 or parts[1].lower() in ("status", "list"):
+                auto = "ON" if self.spell_maintainer.enabled else "OFF"
+                lines = [
+                    f"Spell maintainer: {auto}  (interval {self.spell_maintainer.cycle_interval}s)",
+                    "Spells:",
+                ]
+                for sp in self.spell_maintainer.list_spells():
+                    flag = "ON " if sp.enabled else "OFF"
+                    contexts = []
+                    if sp.maintain_in_combat:
+                        contexts.append("combat")
+                    if sp.maintain_out_of_combat:
+                        contexts.append("idle")
+                    if not contexts:
+                        contexts.append("none")
+                    refresh = (
+                        f"<= {sp.refresh_at_or_below}"
+                        if sp.refresh_at_or_below is not None
+                        else "missing-only"
+                    )
+                    lines.append(
+                        f"  [{flag}] pri={sp.priority} {sp.name:<18} cmd={sp.command!r} "
+                        f"ctx={','.join(contexts)} refresh={refresh} cd={sp.cooldown}s"
+                    )
+                self._print("\n".join(lines))
+            elif len(parts) >= 2 and parts[1].lower() in ("on", "off"):
+                enabled = parts[1].lower() == "on"
+                self.spell_maintainer.set_enabled(enabled)
+                self._print(f"{_CLIENT}Spell maintainer {'enabled' if enabled else 'disabled'}.")
+            elif len(parts) == 3 and parts[2].lower() in ("on", "off"):
+                enabled = parts[2].lower() == "on"
+                ok = self.spell_maintainer.set_spell_enabled(parts[1], enabled)
+                if ok:
+                    self._print(
+                        f"{_CLIENT}Maintained spell {parts[1]!r} "
+                        f"{'enabled' if enabled else 'disabled'}."
+                    )
+                else:
+                    self._print(f"{_ERR}Unknown maintained spell: {parts[1]!r}")
+            else:
+                self._print(
+                    f"{_CLIENT}Usage: #spellmaint on|off|status|list or #spellmaint <name> on|off"
+                )
+
         # ---- game state ----
         elif cmd == "state":
             s = self.state
@@ -591,6 +690,7 @@ class MudApp:
             self.aliases.save()
             self.triggers.save()
             self.skills.save()
+            self.spell_maintainer.save()
             self._print(f"{_CLIENT}Configs saved.")
 
         # ---- restart ----
@@ -598,6 +698,7 @@ class MudApp:
             self.aliases.save()
             self.triggers.save()
             self.skills.save()
+            self.spell_maintainer.save()
             self._print(f"{_CLIENT}Restarting client...")
             self._restart_requested = True
             self._running = False
@@ -823,7 +924,7 @@ class MudApp:
         except ValueError:
             return None
 
-    def _extract_capture_lines(self, text: str) -> str:
+    def _extract_capture_lines(self, text: str) -> list[str]:
         clean = _ANSI_RE.sub("", text)
         out: list[str] = []
         for line in clean.splitlines():
@@ -854,6 +955,29 @@ class MudApp:
                     msg = m.group("msg")
                     out.append(f"{name} ({tag}) '{msg}'")
                     continue
+            # OOC channel variants:
+            #   Name OOC: 'msg'
+            #   Name OOC KINGDOM: 'msg'
+            #   Name OOC CLAN: 'msg'
+            m = _CHANNEL_OOC_RE.match(line.strip())
+            if m:
+                name = m.group("name").strip()
+                scope = (m.group("scope") or "").strip().lower()
+                msg = m.group("msg")
+                tag = "ooc" if not scope else f"ooc {scope}"
+                out.append(f"{name} ({tag}) '{msg}'")
+                continue
+            # Colon-format channels:
+            #   Name KINGDOM: 'msg'
+            #   Name CLAN: 'msg'
+            m = _CHANNEL_COLON_RE.match(line.strip())
+            if m:
+                tag = m.group("tag").strip().lower()
+                if tag in _CHANNEL_TAGS:
+                    name = m.group("name").strip()
+                    msg = m.group("msg")
+                    out.append(f"{name} ({tag}) '{msg}'")
+                    continue
             # Channel tell variant: You tell the group 'msg'
             m = _CHANNEL_TELL_RE.match(line.strip())
             if m:
@@ -871,9 +995,33 @@ class MudApp:
                 msg = m.group("msg")
                 out.append(f"{name} (tell) '{msg}'")
                 continue
-        if not out:
-            return ""
-        return "\n".join(out) + "\n"
+        return out
+
+    def _record_outgoing_command(self, cmd: str) -> None:
+        if not cmd.strip():
+            return
+        changed = self.affects.observe_outgoing_command(cmd)
+        if changed:
+            self._refresh_capture_panes()
+
+    def _refresh_capture_panes(self) -> None:
+        if self._split_ui is None:
+            return
+        capture = ""
+        if self._capture_feed_lines:
+            capture = "\n".join(self._capture_feed_lines) + "\n"
+        self._split_ui.set_capture(capture)
+        self._split_ui.set_affects(self.affects.render_window())
+
+    @staticmethod
+    def _tick_delta(old_minutes: int, new_minutes: int) -> int:
+        if old_minutes < 0 or new_minutes < 0:
+            return 0
+        if new_minutes == old_minutes:
+            return 0
+        # Game prompt time may jump by many in-game minutes per tick
+        # (for example 7:30 -> 8:00), but this is still a single tick event.
+        return 1
 
     @staticmethod
     def _previous_room_candidate(lines: list[str], idx: int) -> Optional[str]:
