@@ -20,6 +20,7 @@ Prefix client meta-commands with #:
 import argparse
 import asyncio
 import logging
+import os
 import socket
 import subprocess
 import sys
@@ -48,6 +49,10 @@ def main() -> None:
                         help="Bridge server address (default 127.0.0.1)")
     parser.add_argument("--bridge-port",  default=4001, type=int,
                         help="Bridge server port (default 4001)")
+    parser.add_argument("--bridge-client-idle-timeout", default=0.0, type=float,
+                        metavar="SECS",
+                        help="When auto-launching the bridge, set its client idle timeout "
+                             "(default 0 disables disconnects)")
     parser.add_argument("--ui",           default="classic",
                         choices=["classic", "split"],
                         help="UI mode: classic prompt or split-pane capture view")
@@ -62,36 +67,49 @@ def main() -> None:
     )
 
     _bridge_proc = None
+    _launched_bridge = False
     if args.launch_bridge:
         args.bridge = True
-        bridge_script = Path(__file__).parent / "bridge.py"
-        _bridge_proc = subprocess.Popen(
-            [
-                sys.executable, str(bridge_script),
-                "--quiet",
-                "--host",        args.host,
-                "--port",        str(args.port),
-                "--bridge-host", args.bridge_host,
-                "--bridge-port", str(args.bridge_port),
-                "--config",      args.config,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        # Wait up to 10 s for the bridge to start listening
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            try:
-                with socket.create_connection(
-                    (args.bridge_host, args.bridge_port), timeout=1
-                ):
-                    break
-            except OSError:
-                time.sleep(0.2)
+        bridge_running = False
+        try:
+            with socket.create_connection((args.bridge_host, args.bridge_port), timeout=1):
+                bridge_running = True
+        except OSError:
+            pass
+
+        if bridge_running:
+            print(f"[CLIENT] Using existing bridge at {args.bridge_host}:{args.bridge_port}")
         else:
-            _bridge_proc.kill()
-            print("ERROR: Bridge server did not start in time.", file=sys.stderr)
-            sys.exit(1)
+            bridge_script = Path(__file__).parent / "bridge.py"
+            _bridge_proc = subprocess.Popen(
+                [
+                    sys.executable, str(bridge_script),
+                    "--quiet",
+                    "--host",        args.host,
+                    "--port",        str(args.port),
+                    "--bridge-host", args.bridge_host,
+                    "--bridge-port", str(args.bridge_port),
+                    "--config",      args.config,
+                    "--client-idle-timeout", str(args.bridge_client_idle_timeout),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            _launched_bridge = True
+            # Wait up to 10 s for the bridge to start listening
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                try:
+                    with socket.create_connection(
+                        (args.bridge_host, args.bridge_port), timeout=1
+                    ):
+                        break
+                except OSError:
+                    time.sleep(0.2)
+            else:
+                _bridge_proc.kill()
+                print("ERROR: Bridge server did not start in time.", file=sys.stderr)
+                sys.exit(1)
 
     from mud.app import MudApp
     if args.bridge:
@@ -119,12 +137,15 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
     finally:
-        if _bridge_proc is not None:
+        restart = getattr(app, '_restart_requested', False)
+        if _bridge_proc is not None and _launched_bridge and not restart:
             _bridge_proc.terminate()
             try:
                 _bridge_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 _bridge_proc.kill()
+        if restart:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 if __name__ == "__main__":

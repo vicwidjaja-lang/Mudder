@@ -24,6 +24,7 @@ Core gameplay behavior:
 - Use `recall` as safe reset anchor when navigation is uncertain.
 - In combat, use configured primary skill loop and watch HP/mana risk.
 - If HP is critical, prioritize escape/recovery over DPS.
+- The liger cub is a charmed companion; do not attack it.
 
 Help-driven onboarding order:
 - `help newbie`
@@ -43,11 +44,16 @@ Route/path logging protocol (Mudder built-ins):
 - Stop capture: `#log stop`
 - Classify immediately: `#log purpose directions` or `#log purpose levelling path` or `#log purpose discard`
 - Prefer starting logs after entering the world and after a fresh `look` so room context is meaningful.
+- Known route (Noitamin): recall (Temple of the Gods) -> Temple of the Gray Order healing room:
+  `s; s; e; e; e; e; u; e; e; d; e; e; s; s; e; e`
+- Known route: Cross Roads -> Temple of the Gray Order healing room:
+  `e; s; s; s; e`
 
 Decision policy:
 - If a step can cause irreversible account/character changes, stop and ask user first.
 - If output is ambiguous, ask one short clarifying question instead of guessing.
 - On disconnect/timeouts, reconnect cleanly and resume from current menu/game state.
+- If SharePlay disconnects after idle, restart bridge with `--client-idle-timeout 0` (or ensure auto-launched bridge uses that flag).
 
 Response style:
 - Keep responses short, action-first, and state-based:

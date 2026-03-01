@@ -18,12 +18,17 @@ Architecture:
 
 import asyncio
 import logging
+import re
 import sys
+from collections import deque
+from pathlib import Path
 from typing import List, Optional
 
 from .client import TelnetClient
 from .game_state import GameState
 from .triggers import TriggerManager
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mKHJABCDsuhl]")
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +42,7 @@ class MudBridgeServer:
         bridge_port: int = 4001,
         config_dir: str = "configs",
         rate_limit: float = 0.5,
+        client_idle_timeout: float = 1800.0,
         quiet: bool = False,
     ):
         self.mud_host = mud_host
@@ -44,8 +50,10 @@ class MudBridgeServer:
         self.bridge_host = bridge_host
         self.bridge_port = bridge_port
         self.config_dir = config_dir
+        self.client_idle_timeout = client_idle_timeout
 
         self.client = TelnetClient(mud_host, mud_port, rate_limit)
+        self.client.on_data(self._on_mud_data)
         self.triggers = TriggerManager(config_dir)
         self.state = GameState()
         self.quiet = quiet
@@ -53,20 +61,15 @@ class MudBridgeServer:
         self._clients: List[asyncio.StreamWriter] = []
         self._send_queue: Optional[asyncio.Queue[str]] = None
 
+        # Rolling log: ~10 pages of ANSI-stripped output for LLM consumption
+        self._log_buffer: deque[str] = deque(maxlen=4500)
+        self._log_path = Path(config_dir) / "bridge_output.log"
+        self._log_dirty = False
+
     async def start(self) -> None:
-        """Connect to MUD, start bridge TCP server, run until cancelled."""
+        """Start local bridge server and keep upstream MUD link healthy."""
         # Bind queue to the active loop used by asyncio.run().
         self._send_queue = asyncio.Queue()
-        logger.info("Connecting to MUD %s:%s ...", self.mud_host, self.mud_port)
-        try:
-            await self.client.connect()
-        except ConnectionError as exc:
-            print(f"[BRIDGE] Connection failed: {exc}")
-            return
-
-        print(f"[BRIDGE] Connected to MUD {self.mud_host}:{self.mud_port}")
-
-        self.client.on_data(self._on_mud_data)
 
         server = await asyncio.start_server(
             self._handle_client_connection,
@@ -75,8 +78,9 @@ class MudBridgeServer:
         )
         print(f"[BRIDGE] Bridge listening on {self.bridge_host}:{self.bridge_port}")
 
-        read_task = asyncio.create_task(self.client.read_loop(), name="bridge_mud_read")
+        mud_task = asyncio.create_task(self._mud_loop(), name="bridge_mud_loop")
         send_task = asyncio.create_task(self._send_loop(), name="bridge_send_loop")
+        log_task  = asyncio.create_task(self._log_flush_loop(), name="bridge_log_flush")
 
         try:
             async with server:
@@ -84,10 +88,37 @@ class MudBridgeServer:
         except asyncio.CancelledError:
             pass
         finally:
+            self._flush_log()  # final write
             await self.client.disconnect()
-            read_task.cancel()
-            send_task.cancel()
-            await asyncio.gather(read_task, send_task, return_exceptions=True)
+            for t in (mud_task, send_task, log_task):
+                t.cancel()
+            await asyncio.gather(mud_task, send_task, log_task, return_exceptions=True)
+
+    async def _mud_loop(self) -> None:
+        """
+        Keep the upstream telnet session alive.
+        If the MUD drops, reconnect with bounded backoff.
+        """
+        backoff = 1.0
+        while True:
+            try:
+                logger.info("Connecting to MUD %s:%s ...", self.mud_host, self.mud_port)
+                await self.client.connect()
+                print(f"[BRIDGE] Connected to MUD {self.mud_host}:{self.mud_port}")
+                backoff = 1.0
+                await self.client.read_loop()
+                logger.warning("Upstream connection ended; reconnecting.")
+            except asyncio.CancelledError:
+                break
+            except ConnectionError as exc:
+                logger.warning("Upstream connect failed: %s", exc)
+            except Exception as exc:
+                logger.exception("Unexpected upstream error: %s", exc)
+            finally:
+                await self.client.disconnect()
+
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2.0, 30.0)
 
     def _on_mud_data(self, text: str) -> None:
         """Sync callback from TelnetClient.read_loop — fan out to all clients."""
@@ -112,6 +143,12 @@ class MudBridgeServer:
         if not self.quiet:
             sys.stdout.write(text)
             sys.stdout.flush()
+
+        # Buffer ANSI-stripped output for LLM log file
+        clean = _ANSI_RE.sub("", text)
+        for line in clean.splitlines(keepends=True):
+            self._log_buffer.append(line)
+        self._log_dirty = True
 
         # Parse state and fire triggers on the bridge side
         self.state.parse(text)
@@ -153,7 +190,12 @@ class MudBridgeServer:
 
         try:
             while True:
-                line = await asyncio.wait_for(reader.readline(), timeout=300)
+                if self.client_idle_timeout and self.client_idle_timeout > 0:
+                    line = await asyncio.wait_for(
+                        reader.readline(), timeout=self.client_idle_timeout
+                    )
+                else:
+                    line = await reader.readline()
                 if not line:
                     break
                 cmd = line.decode("utf-8", errors="replace").rstrip("\r\n")
@@ -161,7 +203,11 @@ class MudBridgeServer:
                 if self._send_queue is not None:
                     await self._send_queue.put(cmd)
         except asyncio.TimeoutError:
-            logger.info("Bridge client idle timeout: %s", peer)
+            logger.info(
+                "Bridge client idle timeout (%ss): %s",
+                self.client_idle_timeout,
+                peer,
+            )
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -175,6 +221,26 @@ class MudBridgeServer:
             except Exception:
                 pass
             logger.info("Bridge client disconnected: %s", peer)
+
+    def _flush_log(self) -> None:
+        """Write the log buffer to disk."""
+        if not self._log_dirty:
+            return
+        try:
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._log_path.write_text("".join(self._log_buffer), encoding="utf-8")
+            self._log_dirty = False
+        except Exception as exc:
+            logger.warning("Log flush failed: %s", exc)
+
+    async def _log_flush_loop(self) -> None:
+        """Flush the log buffer to disk every 5 seconds."""
+        while True:
+            try:
+                await asyncio.sleep(5)
+                self._flush_log()
+            except asyncio.CancelledError:
+                break
 
     async def _send_loop(self) -> None:
         """Drain the send queue through TelnetClient.send() (rate-limited)."""

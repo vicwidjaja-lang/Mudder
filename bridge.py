@@ -9,6 +9,7 @@ Usage:
   python bridge.py                        # connect to dsl-mud.org:4000, listen on 127.0.0.1:4001
   python bridge.py --host example.com --port 4000
   python bridge.py --bridge-port 4002     # use a different local port
+  python bridge.py --client-idle-timeout 0  # disable client idle disconnect
   python bridge.py --log DEBUG            # verbose logging
 
 Workflow:
@@ -41,6 +42,10 @@ def main() -> None:
     parser.add_argument("--rate-limit",   default=0.5, type=float,
                         metavar="SECS",
                         help="Minimum seconds between outgoing MUD commands (default 0.5)")
+    parser.add_argument("--client-idle-timeout", default=1800.0, type=float,
+                        metavar="SECS",
+                        help="Seconds without input before disconnecting a bridge client "
+                             "(default 1800, 0 disables)")
     parser.add_argument("--log",          default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                         help="Log level (default INFO)")
@@ -62,6 +67,7 @@ def main() -> None:
         bridge_port=args.bridge_port,
         config_dir=args.config,
         rate_limit=args.rate_limit,
+        client_idle_timeout=args.client_idle_timeout,
         quiet=args.quiet,
     )
 

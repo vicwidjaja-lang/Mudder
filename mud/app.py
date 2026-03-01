@@ -33,6 +33,7 @@ Built-in client commands (prefix #):
   #dmgmask on|off|status       - compact damage lines to per-round totals
   #dmgmap on|off|status|report|clear - map severe hit words to damage ranges
   #save                        - save all configs
+  #restart                     - save configs and restart the client
   #quit                        - quit client
 
 Script commands (prefix #script):
@@ -52,7 +53,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from .aliases import AliasManager
 from .client import TelnetClient
@@ -61,8 +62,10 @@ from .damage_mask import DamageMask
 from .game_state import GameState
 from .script_engine import ScriptEngine
 from .skills import SkillsManager
-from .split_ui import SplitUI
 from .triggers import TriggerManager
+
+if TYPE_CHECKING:
+    from .split_ui import SplitUI
 
 logger = logging.getLogger(__name__)
 
@@ -76,30 +79,26 @@ _DIRECTION_CMDS = {
     "north", "south", "east", "west", "up", "down",
 }
 _FOR_DAMAGE_RE = re.compile(r"\bfor\s+(\d+)\s+damage\b", re.IGNORECASE)
-_CAPTURE_PATTERNS = (
-    "tells you",
-    "you tell",
-    " says ",
-    "you say",
-    "yell",
-    "shout",
-    "gossip",
-    "auction",
-    "newbie",
-    "broadcast",
-    "group",
-    "clan",
-    "guild",
-    "question",
-    "music",
-)
-
 # DSL bracket-format channels: [Channel] Name: 'message'
 _CHANNEL_TAGS = frozenset((
     "newbie", "gossip", "auction", "clan", "guild",
     "group", "question", "music", "broadcast",
     "immtalk", "claninfo",
 ))
+_CHANNEL_BRACKET_RE = re.compile(r"^\[(?P<tag>[^\]]+)\]\s*(?P<rest>.+)$")
+_CHANNEL_BRACKET_MSG_RE = re.compile(r"^(?P<name>[^:]+):\s*'(?P<msg>.*)'\s*$")
+_CHANNEL_PAREN_RE = re.compile(
+    r"^(?P<name>[A-Za-z][\w'-]*)\s*\((?P<tag>[A-Za-z]+)\)\s*'(?P<msg>.*)'\s*$",
+    re.IGNORECASE,
+)
+_CHANNEL_TELL_RE = re.compile(
+    r"^(?P<name>\w+)\s+tell(?:s)?\s+(?:the\s+)?(?P<tag>[A-Za-z]+)\s*'(?P<msg>.*)'\s*$",
+    re.IGNORECASE,
+)
+_DIRECT_TELL_RE = re.compile(
+    r"^(?P<name>\w+)\s+tells?\s+you\s*'(?P<msg>.*)'\s*$",
+    re.IGNORECASE,
+)
 _SEVERE_DAMAGE_WORDS = (
     "mutilate",
     "disembowel",
@@ -145,6 +144,7 @@ class MudApp:
             enqueue=self._enqueue,
             get_state=lambda: self.state,
             print_fn=self._print,
+            get_char=lambda: self._active_char,
         )
         self._last_room: Optional[str] = None
         self._active_cmd_log: Optional[dict] = None
@@ -157,7 +157,8 @@ class MudApp:
         self.damage_map_enabled: bool = True
         self._pending_severe_labels: list[str] = []
         self._pending_hp_before: Optional[int] = None
-        self._split_ui: Optional[SplitUI] = None
+        self._split_ui: Optional["SplitUI"] = None
+        self._restart_requested: bool = False
 
     # ------------------------------------------------------------------
     # Entry point
@@ -166,7 +167,9 @@ class MudApp:
     async def run(self) -> None:
         if self.ui_mode == "split":
             try:
+                from .split_ui import SplitUI
                 self._split_ui = SplitUI()
+                self._split_ui.set_tick_source(self.state.tick_countdown)
                 await self._split_ui.start()
             except Exception as exc:
                 self._split_ui = None
@@ -223,42 +226,50 @@ class MudApp:
 
         loop = asyncio.get_event_loop()
 
-        # Try to use prompt_toolkit for a nicer experience; fall back to plain
-        try:
-            from prompt_toolkit import PromptSession
-            from prompt_toolkit.history import FileHistory
-            from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-            from prompt_toolkit.patch_stdout import patch_stdout
+        # Try to use prompt_toolkit for a nicer experience when running in a TTY.
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            try:
+                from prompt_toolkit import PromptSession
+                from prompt_toolkit.history import FileHistory
+                from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+                from prompt_toolkit.patch_stdout import patch_stdout
 
-            session = PromptSession(
-                history=FileHistory(".mud_history"),
-                auto_suggest=AutoSuggestFromHistory(),
-            )
-            with patch_stdout():
-                while self._running and self.client.connected:
-                    try:
-                        default = self._last_user_input
-                        line = await session.prompt_async(
-                            "> ",
-                            default=default,
-                            pre_run=self._select_all_input if default else None,
-                        )
-                        # If user just hits Enter on untouched prefill, treat it as no-action.
-                        if default and line == default:
-                            line = ""
-                        await self._handle_input(line)
-                    except (EOFError, KeyboardInterrupt):
-                        break
-        except ImportError:
-            # Plain readline fallback
-            while self._running and self.client.connected:
-                try:
-                    line = await loop.run_in_executor(None, self._readline_prompt)
-                    if line is None:
-                        break
-                    await self._handle_input(line)
-                except (EOFError, KeyboardInterrupt):
+                session = PromptSession(
+                    history=FileHistory(".mud_history"),
+                    auto_suggest=AutoSuggestFromHistory(),
+                )
+                with patch_stdout():
+                    while self._running and self.client.connected:
+                        try:
+                            default = self._last_user_input
+                            line = await session.prompt_async(
+                                "> ",
+                                default=default,
+                                pre_run=self._select_all_input if default else None,
+                            )
+                            # If user just hits Enter on untouched prefill, treat it as no-action.
+                            if default and line == default:
+                                line = ""
+                            await self._handle_input(line)
+                        except (EOFError, KeyboardInterrupt):
+                            break
+                return
+            except ImportError:
+                pass
+            except Exception as exc:
+                self._print(
+                    f"{_WARN}Interactive prompt unavailable ({exc}); falling back to plain input."
+                )
+
+        # Plain readline fallback
+        while self._running and self.client.connected:
+            try:
+                line = await loop.run_in_executor(None, self._readline_prompt)
+                if line is None:
                     break
+                await self._handle_input(line)
+            except (EOFError, KeyboardInterrupt):
+                break
 
     @staticmethod
     def _readline_prompt() -> Optional[str]:
@@ -582,6 +593,16 @@ class MudApp:
             self.skills.save()
             self._print(f"{_CLIENT}Configs saved.")
 
+        # ---- restart ----
+        elif cmd == "restart":
+            self.aliases.save()
+            self.triggers.save()
+            self.skills.save()
+            self._print(f"{_CLIENT}Restarting client...")
+            self._restart_requested = True
+            self._running = False
+            await self.client.disconnect()
+
         # ---- quit ----
         elif cmd in ("quit", "exit", "q"):
             self._running = False
@@ -810,14 +831,46 @@ class MudApp:
             if not low:
                 continue
             # DSL bracket-format: [Help] Name: 'msg', [Gossip] Name: 'msg', etc.
-            if low.startswith("["):
-                tag = low[1:low.index("]")].strip() if "]" in low else ""
+            if line.startswith("["):
+                m = _CHANNEL_BRACKET_RE.match(line.strip())
+                if m:
+                    tag = m.group("tag").strip().lower()
+                    if tag in _CHANNEL_TAGS:
+                        rest = m.group("rest").strip()
+                        mm = _CHANNEL_BRACKET_MSG_RE.match(rest)
+                        if mm:
+                            name = mm.group("name").strip()
+                            msg = mm.group("msg")
+                            out.append(f"{name} ({tag}) '{msg}'")
+                        else:
+                            out.append(line.strip())
+                        continue
+            # Normalized channel line: Name (channel) 'message'
+            m = _CHANNEL_PAREN_RE.match(line.strip())
+            if m:
+                tag = m.group("tag").strip().lower()
                 if tag in _CHANNEL_TAGS:
-                    out.append(line.strip())
+                    name = m.group("name").strip()
+                    msg = m.group("msg")
+                    out.append(f"{name} ({tag}) '{msg}'")
                     continue
-            # Fallback substring patterns for non-bracket formats.
-            if any(pat in low for pat in _CAPTURE_PATTERNS):
-                out.append(line.strip())
+            # Channel tell variant: You tell the group 'msg'
+            m = _CHANNEL_TELL_RE.match(line.strip())
+            if m:
+                tag = m.group("tag").strip().lower()
+                if tag in _CHANNEL_TAGS:
+                    raw_name = m.group("name").strip()
+                    name = "You" if raw_name.lower() == "you" else raw_name
+                    msg = m.group("msg")
+                    out.append(f"{name} ({tag}) '{msg}'")
+                    continue
+            # Direct tell: Bob tells you 'msg'
+            m = _DIRECT_TELL_RE.match(line.strip())
+            if m:
+                name = m.group("name").strip()
+                msg = m.group("msg")
+                out.append(f"{name} (tell) '{msg}'")
+                continue
         if not out:
             return ""
         return "\n".join(out) + "\n"
